@@ -1,6 +1,6 @@
 ---
 name: intuitive-deep-learning
-description: 在 Electron 内置浏览器中启动并使用本地深度学习互动课程。用于学习或讲解神经元、MLP、激活函数、损失函数、梯度下降、数字图像、卷积、CNN、LeNet 和人脸识别等主题，也用于浏览课程图谱、选择学习路径和完成互动练习。
+description: 在 Electron 内置浏览器中启动并使用本地深度学习互动课程。用于学习或讲解神经元、MLP、激活函数、损失函数、梯度下降、数字图像、卷积、CNN、LeNet 和人脸识别等主题，用于浏览课程图谱、选择学习路径和完成互动练习，也用于用户询问本技能是否有更新、要求检查更新或同步最新版时。
 ---
 
 # 深度学习互动实验室
@@ -57,3 +57,7 @@ bash .claude/skills/intuitive-deep-learning/scripts/start-all-services.sh --stop
 ## 完成标准
 
 只有启动结果为 `ok: true`，且匹配用户目标的课程已通过 `browser_navigate` 在 Electron 内置浏览器中打开，才算完成启动。随后继续围绕该课程引导学习，而不是只报告服务已经运行。
+
+## 更新
+
+用户提到更新、检查更新或同步最新版时，完整读取并执行 [references/update.md](references/update.md)。

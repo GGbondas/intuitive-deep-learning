@@ -104,8 +104,10 @@ class RuntimeNamingTests(unittest.TestCase):
         self.assertIn('window.addEventListener("pageshow"', course_map)
         self.assertIn("telemetry.reportSkillMemory()", course_map)
         self.assertIn("var SKILL_MEMORY_ID = 'intuitive-deep-learning'", telemetry)
-        self.assertIn("var MEMORY_EXPORT_ENDPOINT = '/__telemetry/export'", telemetry)
+        self.assertIn("var MEMORY_PENDING_ENDPOINT = '/__telemetry/sync/pending?limit=200'", telemetry)
+        self.assertIn("var MEMORY_ACK_ENDPOINT = '/__telemetry/sync/ack'", telemetry)
         self.assertIn("ipc.reportSkillMemory({", telemetry)
+        self.assertIn("memoryReportInFlight", telemetry)
         self.assertIn("a[data-next-lesson]", telemetry)
 
 
@@ -119,6 +121,40 @@ class ModuleHttpServiceTests(unittest.TestCase):
             inserted = store.insert([{"event_name": "page_view", "module_id": "test"}])
             self.assertEqual(inserted, 1)
             self.assertEqual(store.count(), 1)
+
+    def test_incremental_sync_skips_existing_history_and_only_returns_new_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history_dir = Path(temp_dir)
+            store = BehaviorStore(history_dir)
+            store.insert([{"event_id": "old-event", "event_name": "page_view", "module_id": "old"}])
+            with closing(sqlite3.connect(store.database_path)) as connection:
+                with connection:
+                    connection.execute("DROP TABLE skill_memory_sync_state")
+
+            store = BehaviorStore(history_dir)
+            baseline = store.pending_sync_batch()
+            self.assertEqual(baseline["events"], [])
+            self.assertGreater(baseline["from_cursor"], 0)
+
+            store.insert([{"event_id": "new-event", "event_name": "answer_submit", "module_id": "new"}])
+            pending = store.pending_sync_batch()
+            self.assertEqual([event["event_id"] for event in pending["events"]], ["new-event"])
+            self.assertEqual(pending["event_count"], 1)
+            self.assertGreater(pending["to_cursor"], pending["from_cursor"])
+
+    def test_incremental_sync_retries_until_the_batch_is_acknowledged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = BehaviorStore(Path(temp_dir))
+            store.insert([{"event_id": "pending-event", "event_name": "page_view", "module_id": "test"}])
+
+            first = store.pending_sync_batch()
+            retry = store.pending_sync_batch()
+            self.assertEqual(retry["batch_id"], first["batch_id"])
+            self.assertEqual(retry["events"], first["events"])
+
+            acknowledged = store.acknowledge_sync(first["to_cursor"])
+            self.assertEqual(acknowledged, first["to_cursor"])
+            self.assertEqual(store.pending_sync_batch()["events"], [])
 
     def test_health_contract_survives_file_rename(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

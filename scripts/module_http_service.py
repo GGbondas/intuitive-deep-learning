@@ -34,13 +34,17 @@ DEFAULT_HISTORY_DIR = SKILL_DIR / "history"
 TELEMETRY_PATH = "/__telemetry/events"
 LEARNING_RECORDS_PATH = "/__telemetry/records"
 EXPORT_PATH = "/__telemetry/export"
+SYNC_PENDING_PATH = "/__telemetry/sync/pending"
+SYNC_ACK_PATH = "/__telemetry/sync/ack"
 HEALTH_PATH = "/__telemetry/health"
 TELEMETRY_SCRIPT = '<script src="/shared/telemetry.js"></script>'
 TELEMETRY_COOKIE = "dl_telemetry_token"
 TELEMETRY_TOKEN = "VLTQ9Z2HKguj6x"
-SERVER_CAPABILITIES = ("dataset-mount-v1",)
+SKILL_MEMORY_ID = "intuitive-deep-learning"
+SERVER_CAPABILITIES = ("dataset-mount-v1", "skill-memory-incremental-sync-v1")
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_BATCH_SIZE = 500
+DEFAULT_SYNC_BATCH_SIZE = 200
 EVENT_COLUMNS = (
     "event_id",
     "session_id",
@@ -130,6 +134,27 @@ class BehaviorStore:
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_behavior_active ON behavior_events(is_deleted, time_start)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS skill_memory_sync_state (
+                skill_id TEXT PRIMARY KEY,
+                last_uploaded_rowid INTEGER NOT NULL CHECK (last_uploaded_rowid >= 0),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        now = unix_ms()
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO skill_memory_sync_state (
+                skill_id, last_uploaded_rowid, created_at, updated_at
+            )
+            SELECT ?, COALESCE(MAX(rowid), 0), ?, ?
+            FROM behavior_events
+            """,
+            (SKILL_MEMORY_ID, now, now),
         )
 
     def _initialize(self) -> None:
@@ -280,6 +305,102 @@ class BehaviorStore:
             "events": [self._decode_row(row) for row in rows],
         }
 
+    def pending_sync_batch(
+        self,
+        skill_id: str = SKILL_MEMORY_ID,
+        limit: int = DEFAULT_SYNC_BATCH_SIZE,
+    ) -> dict[str, Any]:
+        safe_limit = max(1, min(MAX_BATCH_SIZE, int(limit)))
+        with self._lock:
+            with closing(self._connect()) as connection:
+                state = connection.execute(
+                    "SELECT last_uploaded_rowid FROM skill_memory_sync_state WHERE skill_id = ?",
+                    (skill_id,),
+                ).fetchone()
+                if state is None:
+                    now = unix_ms()
+                    baseline_row = connection.execute(
+                        "SELECT COALESCE(MAX(rowid), 0) FROM behavior_events"
+                    ).fetchone()
+                    from_cursor = int(baseline_row[0] if baseline_row else 0)
+                    with connection:
+                        connection.execute(
+                            """
+                            INSERT INTO skill_memory_sync_state (
+                                skill_id, last_uploaded_rowid, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?)
+                            """,
+                            (skill_id, from_cursor, now, now),
+                        )
+                else:
+                    from_cursor = int(state["last_uploaded_rowid"])
+
+                rows = connection.execute(
+                    f"""
+                    SELECT rowid AS sync_cursor, {', '.join(EVENT_COLUMNS)}
+                    FROM behavior_events
+                    WHERE rowid > ? AND is_deleted = 0
+                    ORDER BY rowid ASC
+                    LIMIT ?
+                    """,
+                    (from_cursor, safe_limit),
+                ).fetchall()
+                to_cursor = int(rows[-1]["sync_cursor"]) if rows else from_cursor
+                has_more = bool(
+                    connection.execute(
+                        "SELECT 1 FROM behavior_events WHERE rowid > ? AND is_deleted = 0 LIMIT 1",
+                        (to_cursor,),
+                    ).fetchone()
+                )
+
+        events = [self._decode_row(row) for row in rows]
+        return {
+            "schema_version": 4,
+            "mode": "incremental",
+            "skill_id": skill_id,
+            "source": "history/behavior.sqlite3",
+            "batch_id": f"{skill_id}:{from_cursor}:{to_cursor}",
+            "from_cursor": from_cursor,
+            "to_cursor": to_cursor,
+            "event_count": len(events),
+            "has_more": has_more,
+            "exported_at": unix_ms(),
+            "events": events,
+        }
+
+    def acknowledge_sync(self, cursor: int, skill_id: str = SKILL_MEMORY_ID) -> int:
+        safe_cursor = int(cursor)
+        if safe_cursor < 0:
+            raise ValueError("cursor must be non-negative")
+
+        with self._lock:
+            with closing(self._connect()) as connection:
+                state = connection.execute(
+                    "SELECT last_uploaded_rowid FROM skill_memory_sync_state WHERE skill_id = ?",
+                    (skill_id,),
+                ).fetchone()
+                if state is None:
+                    raise ValueError("sync state is not initialized")
+                current = int(state["last_uploaded_rowid"])
+                maximum_row = connection.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM behavior_events"
+                ).fetchone()
+                maximum = int(maximum_row[0] if maximum_row else 0)
+                if safe_cursor > maximum:
+                    raise ValueError("cursor exceeds the latest behavior event")
+                if safe_cursor <= current:
+                    return current
+                with connection:
+                    connection.execute(
+                        """
+                        UPDATE skill_memory_sync_state
+                        SET last_uploaded_rowid = ?, updated_at = ?
+                        WHERE skill_id = ?
+                        """,
+                        (safe_cursor, unix_ms(), skill_id),
+                    )
+                return safe_cursor
+
     def count(self) -> int:
         with closing(self._connect()) as connection:
             row = connection.execute("SELECT COUNT(*) FROM behavior_events WHERE is_deleted = 0").fetchone()
@@ -354,6 +475,20 @@ class ModuleRequestHandler(SimpleHTTPRequestHandler):
         self._send_json(401, {"ok": False, "error": "telemetry-auth-required"})
         return False
 
+    def _read_json_payload(self) -> tuple[bool, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > MAX_REQUEST_BYTES:
+            self._send_json(413, {"ok": False, "error": "invalid-content-length"})
+            return False, None
+        try:
+            return True, json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(400, {"ok": False, "error": "invalid-json"})
+            return False, None
+
     def _html_file(self) -> Path | None:
         request_path = urlsplit(self.path).path
         translated = Path(self.translate_path(request_path))
@@ -418,7 +553,7 @@ class ModuleRequestHandler(SimpleHTTPRequestHandler):
                 },
             )
             return
-        if parsed.path in {TELEMETRY_PATH, LEARNING_RECORDS_PATH, EXPORT_PATH} and not self._require_telemetry_token():
+        if parsed.path in {TELEMETRY_PATH, LEARNING_RECORDS_PATH, EXPORT_PATH, SYNC_PENDING_PATH} and not self._require_telemetry_token():
             return
         if parsed.path == LEARNING_RECORDS_PATH:
             self._send_json(
@@ -433,6 +568,15 @@ class ModuleRequestHandler(SimpleHTTPRequestHandler):
                 document,
                 headers={"Content-Disposition": 'attachment; filename="telemetry-events.json"'},
             )
+            return
+        if parsed.path == SYNC_PENDING_PATH:
+            query = parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", [str(DEFAULT_SYNC_BATCH_SIZE)])[0])
+            except ValueError:
+                self._send_json(400, {"ok": False, "error": "invalid-pagination"})
+                return
+            self._send_json(200, self.behavior_store.pending_sync_batch(limit=limit))
             return
         if parsed.path == TELEMETRY_PATH:
             query = parse_qs(parsed.query)
@@ -456,7 +600,7 @@ class ModuleRequestHandler(SimpleHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if self._redirect_directory_without_slash():
             return
-        if parsed.path in {HEALTH_PATH, TELEMETRY_PATH, LEARNING_RECORDS_PATH, EXPORT_PATH}:
+        if parsed.path in {HEALTH_PATH, TELEMETRY_PATH, LEARNING_RECORDS_PATH, EXPORT_PATH, SYNC_PENDING_PATH}:
             self.do_GET()
             return
         html_path = self._html_file()
@@ -466,24 +610,31 @@ class ModuleRequestHandler(SimpleHTTPRequestHandler):
         super().do_HEAD()
 
     def do_POST(self) -> None:
-        if urlsplit(self.path).path != TELEMETRY_PATH:
+        request_path = urlsplit(self.path).path
+        if request_path not in {TELEMETRY_PATH, SYNC_ACK_PATH}:
             self._send_json(404, {"ok": False, "error": "not-found"})
             return
         if not self._require_telemetry_token():
             return
-
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = 0
-        if length <= 0 or length > MAX_REQUEST_BYTES:
-            self._send_json(413, {"ok": False, "error": "invalid-content-length"})
+        payload_ok, payload = self._read_json_payload()
+        if not payload_ok:
             return
 
-        try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            self._send_json(400, {"ok": False, "error": "invalid-json"})
+        if request_path == SYNC_ACK_PATH:
+            if not isinstance(payload, dict):
+                self._send_json(400, {"ok": False, "error": "invalid-sync-ack"})
+                return
+            try:
+                cursor = int(payload.get("cursor"))
+                acknowledged = self.behavior_store.acknowledge_sync(cursor)
+            except (TypeError, ValueError) as exc:
+                self._send_json(400, {"ok": False, "error": "invalid-sync-cursor", "detail": str(exc)})
+                return
+            except sqlite3.Error as exc:
+                print(f"[module-http:sync] database write failed: {type(exc).__name__}: {exc}", flush=True)
+                self._send_json(503, {"ok": False, "error": "telemetry-storage-unavailable"})
+                return
+            self._send_json(200, {"ok": True, "skill_id": SKILL_MEMORY_ID, "cursor": acknowledged})
             return
 
         events = payload.get("events") if isinstance(payload, dict) else payload

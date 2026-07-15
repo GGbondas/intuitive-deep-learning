@@ -4,7 +4,8 @@
   if (window.__DL_TELEMETRY__) return;
 
   var ENDPOINT = '/__telemetry/events';
-  var MEMORY_EXPORT_ENDPOINT = '/__telemetry/export';
+  var MEMORY_PENDING_ENDPOINT = '/__telemetry/sync/pending?limit=200';
+  var MEMORY_ACK_ENDPOINT = '/__telemetry/sync/ack';
   var SKILL_MEMORY_ID = 'intuitive-deep-learning';
   var BEHAVIOR_DATABASE_SOURCE = 'intuitive-deep-learning/history/behavior.sqlite3';
   var NEXT_LESSON_SELECTOR = 'a[data-next-lesson]';
@@ -26,6 +27,7 @@
   var questionAttempts = new WeakMap();
   var observedQuestions = new WeakSet();
   var pageLeaveEmitted = false;
+  var memoryReportInFlight = null;
 
   function createId(prefix) {
     var value = window.crypto && typeof window.crypto.randomUUID === 'function'
@@ -287,36 +289,65 @@
     }, { time_start: pageStartedAtUnix, time_end: endedAt });
   }
 
+  function fetchPendingMemoryBatch() {
+    return window.fetch(MEMORY_PENDING_ENDPOINT, { cache: 'no-store' })
+      .then(function (response) {
+        if (!response.ok) throw new Error('behavior-sync-pending-http-' + response.status);
+        return response.json();
+      });
+  }
+
+  function acknowledgeMemoryBatch(cursor) {
+    return window.fetch(MEMORY_ACK_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ skill_id: SKILL_MEMORY_ID, cursor: cursor })
+    }).then(function (response) {
+      if (!response.ok) throw new Error('behavior-sync-ack-http-' + response.status);
+      return response.json();
+    }).then(function (result) {
+      if (!result || result.ok !== true) throw new Error('behavior-sync-ack-failed');
+      return result;
+    });
+  }
+
+  function uploadPendingMemoryBatches(ipc) {
+    return fetchPendingMemoryBatch().then(function (batch) {
+      if (!batch || !Array.isArray(batch.events)) throw new Error('behavior-sync-invalid-batch');
+      if (!batch.events.length) return true;
+
+      batch.source = BEHAVIOR_DATABASE_SOURCE;
+      return ipc.reportSkillMemory({
+        skill_id: SKILL_MEMORY_ID,
+        content: JSON.stringify(batch)
+      }).then(function (saved) {
+        if (!saved || saved.ok !== true) {
+          throw new Error(saved && saved.error ? saved.error : 'skill-memory-report-failed');
+        }
+        return acknowledgeMemoryBatch(batch.to_cursor);
+      }).then(function () {
+        return batch.has_more ? uploadPendingMemoryBatches(ipc) : true;
+      });
+    });
+  }
+
   function reportSkillMemory() {
     var ipc = window.__growAgentIpc;
     if (!ipc || typeof ipc.reportSkillMemory !== 'function') return Promise.resolve(false);
+    if (memoryReportInFlight) return memoryReportInFlight;
 
-    return flushAll()
+    memoryReportInFlight = flushAll()
       .then(function () {
-        return window.fetch(MEMORY_EXPORT_ENDPOINT, { cache: 'no-store' });
-      })
-      .then(function (response) {
-        if (!response.ok) throw new Error('behavior-export-http-' + response.status);
-        return response.json();
-      })
-      .then(function (snapshot) {
-        snapshot.source = BEHAVIOR_DATABASE_SOURCE;
-        return ipc.reportSkillMemory({
-          skill_id: SKILL_MEMORY_ID,
-          content: JSON.stringify(snapshot)
-        });
-      })
-      .then(function (saved) {
-        if (!saved || saved.ok !== true) {
-          console.warn('[telemetry] skill memory report failed', saved && saved.error ? saved.error : 'unknown-error');
-          return false;
-        }
-        return true;
+        return uploadPendingMemoryBatches(ipc);
       })
       .catch(function (error) {
         console.warn('[telemetry] skill memory report failed', error);
         return false;
+      })
+      .finally(function () {
+        memoryReportInFlight = null;
       });
+    return memoryReportInFlight;
   }
 
   function shouldInterceptNextNavigation(event, link) {
