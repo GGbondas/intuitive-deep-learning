@@ -1,87 +1,75 @@
 # 更新技能
 
-默认更新源是 `https://gitee.com/ssocean/intuitive-deep-learning.git`。该仓库是技能代码和资源的唯一真相；安装目录不是用户工作区，不允许用户修改。用户询问“有没有更新”“检查更新”，或要求更新课程、同步最新版时，检查并直接应用更新，不要再次询问是否安装。
+默认更新源是 `https://gitee.com/ssocean/intuitive-deep-learning.git`。本地目录是用户下载的安装包，可能被任意修改，也可能有或没有 `.git`。用户询问“有没有更新”“检查更新”，或要求更新课程、同步最新版时才执行本流程；确认需要更新后直接安装，不要再次询问。
 
-只保留程序生成的 `runtime_logs/` 和 `history/`。其他本地差异、残留旧文件、缓存和未跟踪文件都不保留。
+官方仓库是技能代码和资源的唯一真相。不要合并本地源码修改；更新时把旧包保留为备份，只迁移程序生成的 `runtime_logs/` 和 `history/`。
 
-## 判断是否为 Git 目录
+## 下载并验证官方版本
 
-将当前加载的 `SKILL.md` 所在目录记为 `skill_dir`，解析真实路径后检查 Git 顶层目录：
-
-```bash
-skill_dir="/absolute/path/to/intuitive-deep-learning"
-skill_root="$(cd "$skill_dir" && pwd -P)"
-repo_root="$(git -C "$skill_dir" rev-parse --show-toplevel 2>/dev/null || true)"
-if [ -n "$repo_root" ]; then repo_root="$(cd "$repo_root" && pwd -P)"; fi
-```
-
-- `repo_root` 的真实路径等于 `skill_root`：技能目录是独立 Git 目录。
-- `repo_root` 为空或指向技能目录的父目录：技能目录不是独立 Git 目录。父目录属于宿主项目，不要对宿主仓库执行任何更新命令。
-- 技能目录内存在 `.git`，但 `git rev-parse` 失败：Git 元数据已损坏，按非 Git 目录完整替换，不要尝试修复或复用损坏的元数据。
-
-## 不是独立 Git 目录
-
-把 Gitee 默认分支浅克隆到技能目录的同一父目录并验证关键文件。用临时仓库的索引比较整个安装目录；相同时报告已经是最新版，不改动目录。存在任何非忽略差异时，停止服务，保留允许的运行状态，然后用下载好的目录整体替换安装目录。整体替换后安装目录将成为独立 Git 仓库。
+将当前加载的 `SKILL.md` 所在目录记为 `skill_root`。临时目录必须创建在同一父目录，确保替换时可以直接重命名：
 
 ```bash
+skill_root="$(cd "/absolute/path/to/intuitive-deep-learning" && pwd -P)"
 parent_dir="$(dirname "$skill_root")"
-tmp_dir="$(mktemp -d "$parent_dir/.intuitive-deep-learning-update.XXXXXX")"
+package_name="$(basename "$skill_root")"
+tmp_dir="$(mktemp -d "$parent_dir/.${package_name}-update.XXXXXX")"
 git clone --depth 1 https://gitee.com/ssocean/intuitive-deep-learning.git "$tmp_dir/latest"
 test -f "$tmp_dir/latest/SKILL.md"
 test -f "$tmp_dir/latest/modules/index.json"
 test -f "$tmp_dir/latest/scripts/run-lesson-page.sh"
+remote_commit="$(git -C "$tmp_dir/latest" rev-parse HEAD)"
 new_version="$(git -C "$tmp_dir/latest" rev-parse --short HEAD)"
-differences="$(git --git-dir="$tmp_dir/latest/.git" --work-tree="$skill_root" status --porcelain --untracked-files=all)"
 ```
 
-仅当 `differences` 非空时执行：
+克隆或任一校验失败时删除临时目录并停止，不要改动现有安装包。
+
+## 判断是否需要更新
+
+Git 仅用于判断版本，不用于合并或修复本地包：
+
+1. 若 `skill_root` 本身是独立 Git 仓库，且 `origin` 是上述官方 Gitee 地址，读取本地 `HEAD`。只有本地提交等于 `remote_commit`，并且 `git status --porcelain --untracked-files=all` 为空时，才能报告已经是最新版。
+2. 其他情况使用临时仓库的索引比较官方文件与本地目录。比较结果为空时，说明官方文件一致，可以报告已经是最新版；本地被忽略的运行文件不参与比较。
+3. 提交不同、官方文件缺失、内容不同、存在本地源码修改或存在非忽略的额外文件时，都视为需要更新。不要尝试判断这些差异是用户定制、旧版本残留还是损坏文件。
+
+可使用以下命令获取判断信息：
 
 ```bash
-bash "$skill_root/scripts/start-all-services.sh" --stop
-for path in settings.json runtime_logs history; do
+repo_root="$(git -C "$skill_root" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -n "$repo_root" ]; then repo_root="$(cd "$repo_root" && pwd -P)"; fi
+origin_url="$(git -C "$skill_root" remote get-url origin 2>/dev/null || true)"
+local_commit="$(git -C "$skill_root" rev-parse HEAD 2>/dev/null || true)"
+local_status="$(git -C "$skill_root" status --porcelain --untracked-files=all 2>/dev/null || true)"
+package_status="$(git --git-dir="$tmp_dir/latest/.git" --work-tree="$skill_root" status --porcelain --untracked-files=all)"
+```
+
+`repo_root` 指向父目录时，那是桌面智能体的宿主仓库，不是技能包仓库；不要对它执行任何更新命令。若本地 Git 远端不是官方地址，不要从该远端拉取，直接按官方快照比较和替换。
+
+## 替换安装包
+
+仅在确认需要更新后执行。先尽力停止旧服务，再将允许保留的运行目录复制到新版。把旧包重命名为带时间戳的备份，然后把已验证的新包移动到原路径：
+
+```bash
+if [ -f "$skill_root/scripts/start-all-services.sh" ]; then
+  bash "$skill_root/scripts/start-all-services.sh" --stop || true
+fi
+for path in runtime_logs history; do
   if [ -e "$skill_root/$path" ]; then cp -a "$skill_root/$path" "$tmp_dir/latest/"; fi
 done
-backup_dir="$tmp_dir/previous"
+backup_dir="$parent_dir/${package_name}.backup.$(date +%Y%m%d%H%M%S).$$"
 mv "$skill_root" "$backup_dir"
-if mv "$tmp_dir/latest" "$skill_root"; then
-  rm -rf "$backup_dir"
+if mv "$tmp_dir/latest" "$skill_root" && git -C "$skill_root" rev-parse --is-inside-work-tree; then
+  :
 else
+  if [ -e "$skill_root" ]; then mv "$skill_root" "$tmp_dir/failed"; fi
   mv "$backup_dir" "$skill_root"
   exit 1
 fi
-git -C "$skill_root" rev-parse --is-inside-work-tree
 ```
 
-克隆、校验或服务停止失败时，不要移动现有目录。替换失败时立即恢复 `backup_dir`。完成或确认无需更新后删除临时目录。
-
-## 是独立 Git 目录
-
-读取 `origin`，只接受 `https://gitee.com/ssocean/intuitive-deep-learning.git`、省略 `.git` 的同地址或对应的 Gitee SSH 地址。远端缺失或不匹配时停止，不要从未知仓库更新，也不要擅自修改远端。
-
-获取 Gitee 当前默认分支，不要写死 `main` 或 `master`。比较远端提交、本地 `HEAD` 和工作区状态；三者一致时报告已经是最新版。只要提交或文件状态不同，就把所有受控文件强制对齐远端，并删除除 Git 忽略项以外的未跟踪文件。不要保留本地代码修改、本地提交或分叉历史。
-
-```bash
-origin_url="$(git -C "$skill_root" remote get-url origin)"
-git -C "$skill_root" fetch --prune origin
-git -C "$skill_root" remote set-head origin --auto
-target_ref="$(git -C "$skill_root" symbolic-ref refs/remotes/origin/HEAD)"
-old_version="$(git -C "$skill_root" rev-parse --short HEAD)"
-new_version="$(git -C "$skill_root" rev-parse --short "$target_ref")"
-differences="$(git -C "$skill_root" status --porcelain --untracked-files=all)"
-```
-
-仅当 `old_version` 与 `new_version` 不同或 `differences` 非空时执行：
-
-```bash
-bash "$skill_root/scripts/start-all-services.sh" --stop
-git -C "$skill_root" reset --hard "$target_ref"
-git -C "$skill_root" clean -fd
-```
-
-`git clean -fd` 不删除 `.gitignore` 已忽略的 `settings.json`、`runtime_logs/` 和 `history/`。重置或清理失败时报告更新失败，不要声称已经完成。
+新版移动或验证失败时，立即恢复 `backup_dir`。成功后保留备份并向用户报告其路径，不要自动删除；用户的本地修改只存在于该备份中，不进入新版。删除已经为空的临时目录。
 
 ## 完成与失败
 
-安装目录不可写、网络受限或需要额外权限时，按宿主环境的审批机制申请访问 Gitee 和写入技能目录。不要把权限、下载或获取失败误报为已经是最新版。
+安装目录不可写、网络受限或需要额外权限时，按桌面智能体的审批机制申请访问 Gitee 和写入安装目录。不要把权限、下载或比较失败误报为已经是最新版。
 
-只有比较结果一致或目录已成功对齐远端后才能报告完成。更新后重新读取新的 `SKILL.md`、本文件和 `modules/index.json`，向用户报告结果及 `new_version`；发生更新时同时报告 `old_version`（非 Git 目录可能没有该值）。用户还要求打开课程时，再按新说明重新启动课程。
+替换成功后重新读取新版 `SKILL.md`、本文件和 `modules/index.json`，报告 `new_version` 和 `backup_dir`。用户还要求打开课程时，再按新版说明重新启动课程。
